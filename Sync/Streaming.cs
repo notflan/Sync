@@ -352,7 +352,7 @@ namespace Sync.Pipeline
         public void Dispose()
         {
             disposed = true;
-            Set();
+	    Task.Run(() => this.tcs.TrySetResult(true));
         }
     }
     public class FixedCache<T> : ICache<T>, IDisposable where T : struct
@@ -624,14 +624,14 @@ namespace Sync.Pipeline
     /// </summary>
     public class ChanneledStream : Stream, IChannel<byte>
     {
-        Channel<byte[]> buffer;
-        ICache<byte> cache;
-        public object mutex = new object();
+        protected Channel<byte[]> buffer;
+        protected ICache<byte> cache;
+        protected readonly object mutex = new object();
 
         /// <summary>
         /// Create a new ChanneledStream with limited buffer size.
         /// </summary>
-        /// <param name="max"></param>
+        /// <param name="max">The max writes able to be stored in the buffer at once.</param>
         public ChanneledStream(int max) : this(max, 0) { }
         /// <summary>
         /// Create a new ChanneledStream with unlimited buffer size.
@@ -778,7 +778,7 @@ namespace Sync.Pipeline
                     cache.Cache(by);
             }
         }
-        public int cacheCount
+        private int cacheCount
         {
             get
             {
