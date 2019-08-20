@@ -30,6 +30,163 @@ namespace Sync.Pipeline
         /// </summary>
         void Close();
     }
+    public class AsyncAutoResetEvent : IDisposable
+    {
+        private static readonly Task s_completed = Task.FromResult(true);
+        private readonly Queue<TaskCompletionSource<bool>> m_waits = new Queue<TaskCompletionSource<bool>>();
+        private bool m_signaled;
+
+        private bool disposed = false;
+
+        public Task WaitAsync()
+        {
+            lock (m_waits)
+            {
+                if (disposed)
+                    return s_completed;
+                if (m_signaled)
+                {
+                    m_signaled = false;
+                    return s_completed;
+                }
+                else
+                {
+                    var tcs = new TaskCompletionSource<bool>();
+                    m_waits.Enqueue(tcs);
+                    return tcs.Task;
+                }
+            }
+        }
+
+        public void Dispose()
+        {
+            lock (m_waits)
+            {
+                disposed = true;
+                while (m_waits.Count > 0)
+                    m_waits.Dequeue().SetResult(true);
+            }
+        }
+
+        public void Set()
+        {
+            TaskCompletionSource<bool> toRelease = null;
+
+            lock (m_waits)
+            {
+                if (disposed)
+                    return;
+                if (m_waits.Count > 0)
+                    toRelease = m_waits.Dequeue();
+                else if (!m_signaled)
+                    m_signaled = true;
+            }
+
+            toRelease?.SetResult(true);
+        }
+    }
+    public class AsyncMutex : IDisposable
+    {
+        private SemaphoreSlim sem;
+        public AsyncMutex()
+        {
+            sem = new SemaphoreSlim(1, 1);
+        }
+        public class HeldLock : IDisposable
+        {
+            private AsyncMutex super;
+            public HeldLock(AsyncMutex m)
+            {
+                super = m;
+            }
+
+            public void Dispose()
+            {
+                super.sem.Release();
+            }
+
+            public async Task Wait()
+            {
+                await super.sem.WaitAsync();
+            }
+        }
+        public async Task<HeldLock> Wait()
+        {
+            var hl = new HeldLock(this);
+            await hl.Wait();
+            return hl;
+        }
+        public HeldLock WaitSync()
+        {
+            var t = Wait();
+            t.Wait();
+            return t.Result;
+        }
+        public void Dispose()
+        {
+            sem.Dispose();
+        }
+    }
+    public class AsyncChannel<T> : IDisposable, IChannel<T>
+    {
+        private bool alive = true;
+        public bool IsOpen { get { return alive; } }
+        private AsyncMutex mSend = new AsyncMutex();
+        private AsyncAutoResetEvent eSend = new AsyncAutoResetEvent();
+        private Queue<T> queue = new Queue<T>();
+
+        public void Close()
+        {
+            Dispose();
+        }
+
+        public void Dispose()
+        {
+            alive = false;
+            using (mSend.WaitSync())
+            {
+                eSend.Dispose();
+            }
+            mSend.Dispose();
+        }
+
+        T IChannel<T>.Receive()
+        {
+            var t = Receive();
+            t.Wait();
+            return t.Result;
+        }
+        public async Task<T> Receive()
+        {
+            while (alive)
+            {
+                await eSend.WaitAsync();
+                using (await mSend.Wait())
+                {
+                    if (!alive) break;
+                    if (queue.Count > 0)
+                        return queue.Dequeue();
+                }
+            }
+            return default(T);
+        }
+
+        void IChannel<T>.Send(T obj)
+        {
+            Send(obj).Wait();
+        }
+
+        public async Task Send(T obj)
+        {
+            if (!alive) return;
+            using (await mSend.Wait())
+            {
+                if (!alive) return;
+                queue.Enqueue(obj);
+                eSend.Set();
+            }
+        }
+    }
     /// <summary>
     /// Provides a method of sending/receiving objects between threads atomically.
     /// </summary>
@@ -126,7 +283,7 @@ namespace Sync.Pipeline
             goto start;
         }
 
-        private bool closing = false;
+        private bool closing { get; set; } = false;
 
         /// <summary>
         /// Receive an object from the channel. Blocks until there is an object or the channel is closed.
@@ -448,6 +605,26 @@ namespace Sync.Pipeline
             var ts = new System.Threading.Tasks.Task(a);
             ts.Start();
             return ts;
+        }
+
+        public static async Task<bool> Go(Action<CancellationToken> a, TimeSpan timeout)
+        {
+            var tokSrc = new CancellationTokenSource();
+
+            var ts = new Task(() =>
+            {
+                a(tokSrc.Token);
+                tokSrc.Dispose();
+            });
+            ts.Start();
+
+            if (await Task.WhenAny(ts, Task.Delay(timeout)) == ts)
+                return true;
+            else
+            {
+                tokSrc.Cancel();
+                return false;
+            }
         }
 
         /// <summary>

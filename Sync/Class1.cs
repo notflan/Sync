@@ -16,8 +16,279 @@ namespace Sync
     /// A serialisable hashtable for sending over Client's pipeline.
     /// Writes and reads itself from a stream blocking.
     /// </summary>
-    public class Message
+    public class Message : IDisposable
     {
+        /// <summary>
+        /// Dispose all values that implement IDisposable.
+        /// </summary>
+        public void Dispose()
+        {
+            foreach (var kv in map.Hashtable)
+            {
+                if (kv.Value is IDisposable)
+                    (kv.Value as IDisposable).Dispose();
+            }
+        }
+        /// <summary>
+        /// A mechanism for sending buffered data form a Stream in a Message
+        /// </summary>
+        [Serializable]
+        public class LongStream : ISerializable, IDisposable
+        {
+            /// <summary>
+            /// A tag, can be used to communicate information about this Stream to the receiver.
+            /// </summary>
+            public string Tag { get; set; } = null;
+            /// <summary>
+            /// The underlying stream.
+            /// </summary>
+            public Stream Backing { get; set; }
+            /// <summary>
+            /// The current length of this stream.
+            /// </summary>
+            public long StreamLength { get; set; }
+            /// <summary>
+            /// This metadata's ID.
+            /// </summary>
+            public Guid UUID { get; set; }
+
+            /// <summary>
+            /// Do not dispose the underlying stream when disposing?
+            /// </summary>
+            public bool KeepAlive { get; set; } = false;
+
+            /// <summary>
+            /// Recalculate StreamLength.
+            /// </summary>
+            public void RecalculateLength()
+            {
+                StreamLength = Backing.Length;
+            }
+
+            /// <summary>
+            /// Create a null LongStream.
+            /// </summary>
+            public LongStream()
+            {
+                Backing = null;
+            }
+
+            public override bool Equals(object obj)
+            {
+                if (obj == null) return false;
+                else if (obj is LongStream)
+                    (obj as LongStream).UUID.Equals(UUID);
+                return base.Equals(obj);
+            }
+
+            public override int GetHashCode()
+            {
+                return UUID.GetHashCode();
+            }
+
+            /// <summary>
+            /// Generate a new UUID for this Stream.
+            /// </summary>
+            public void Generate()
+            {
+                UUID = Guid.NewGuid();
+            }
+
+            /// <summary>
+            /// Set backing Stream and recalculate length.
+            /// </summary>
+            /// <param name="copyFrom">The stream to use.</param>
+            public void SetStream(Stream copyFrom)
+            {
+                Backing = copyFrom;
+                StreamLength = copyFrom.Length;
+            }
+
+            /// <summary>
+            /// Release all resources.
+            /// </summary>
+            public virtual void Dispose()
+            {
+                if (Backing != null && !KeepAlive)
+                {
+                    Backing.Dispose();
+                    Backing = null;
+                }
+            }
+            public override string ToString()
+            {
+                return UUID.ToString() + " <" + StreamLength + (Tag == null ? "" : ":" + Tag) + "> (" + ((object)Backing ?? "<disposed>").ToString() + ")";
+            }
+            /// <summary>
+            /// Create a LongStream that referrences another stream.
+            /// </summary>
+            /// <param name="copyFrom">The stream to use.</param>
+            public LongStream(Stream copyFrom)
+            {
+                Generate();
+                SetStream(copyFrom);
+                KeepAlive = true;
+            }
+            /// <summary>
+            /// Create a LongStream that referrences another stream.
+            /// </summary>
+            /// <param name="copyFrom">The stream to use.</param>
+            /// <param name="name">The tag to give this instance.</param>
+            public LongStream(Stream copyFrom, string name)
+            : this(copyFrom)
+            {
+                Tag = name;
+            }
+            public LongStream(SerializationInfo info, StreamingContext context)
+            {
+                Backing = null;
+                UUID = Guid.Parse((string)info.GetValue("uuid", typeof(string)));
+                StreamLength = (long)info.GetValue("length", typeof(long));
+                Tag = (string)info.GetValue("tag", typeof(string));
+                BlockSize = (int)info.GetValue("blocksize", typeof(int));
+            }
+            public void GetObjectData(SerializationInfo info, StreamingContext context)
+            {
+                info.AddValue("uuid", UUID.ToString());
+                info.AddValue("length", StreamLength);
+                info.AddValue("tag", Tag);
+                info.AddValue("blocksize", BlockSize);
+            }
+
+            void writeString(Stream to, string thing)
+            {
+                byte[] b = Encoding.UTF8.GetBytes(thing);
+                to.Write(BitConverter.GetBytes((int)b.Length), 0, sizeof(int));
+                if(b.Length>0)
+                to.Write(b, 0, b.Length);
+            }
+
+            string readString(Stream from)
+            {
+                byte[] _sz = new byte[sizeof(int)];
+                from.BlockingRead(_sz, 0, _sz.Length);
+                int sz = BitConverter.ToInt32(_sz, 0);
+                if (sz < 0) throw new InvalidDataException("String size less than 0");
+                if (sz == 0) return "";
+                byte[] _buf = new byte[sz];
+                from.BlockingRead(_buf, 0, sz);
+                return Encoding.UTF8.GetString(_buf);
+            }   
+
+            public void WriteStream(Stream to)
+            {
+                if (Backing == null) throw new NullReferenceException("Backing stream cannot be null.");
+                RecalculateLength();
+
+                to.Write(UUID.ToByteArray(), 0, 16);
+                to.Write(BitConverter.GetBytes(StreamLength), 0, sizeof(long));
+                to.Write(BitConverter.GetBytes(BlockSize), 0, sizeof(int));
+                writeString(to, Tag??"");
+
+                //var pos = to.Position;
+                //Backing.Position = 0;
+
+                WriteRest(to);
+                //Backing.Position = pos;
+            }
+            
+
+            protected virtual void WriteRest(Stream to)
+            {
+                byte[] buffer = new byte[BlockSize];
+                int rd;
+                while ((rd = Backing.Read(buffer, 0, BlockSize)) > 0)
+                {
+                    WriteBlock(to, buffer, rd);
+                }
+            }
+
+            protected void WriteBlock(Stream to, byte[] buffer, int rd)
+            {
+                to.Write(buffer, 0, rd);
+            }
+
+            /// <summary>
+            /// Write block size.
+            /// </summary>
+            public int BlockSize { get; set; } = 4096;
+
+            /// <summary>
+            /// Maximum allocated memory for reading.
+            /// </summary>
+            public int MaxBlockSize { get; set; } = (1024 * 1024 * 1024);
+
+            public Func<LongStream, Stream> StreamReadCreate { get; set; } = (t) => new MemoryStream();
+
+            public void ReadStream(Stream from)
+            {
+                if (Backing == null) Backing = StreamReadCreate(this);
+                var pos = Backing.Position;
+
+                byte[] _uuid = new byte[16];
+                byte[] _sz = new byte[sizeof(long)];
+                byte[] _bs = new byte[sizeof(int)];
+
+                from.BlockingRead(_uuid, 0, 16);
+                from.BlockingRead(_sz, 0, sizeof(long));
+                from.BlockingRead(_bs, 0, sizeof(int));
+                string _str = readString(from);
+
+
+                UUID = new Guid(_uuid);
+                StreamLength = BitConverter.ToInt64(_sz, 0);
+                BlockSize = BitConverter.ToInt32(_bs, 0);
+                Tag = _str.Equals("") ? null : _str;
+
+                if (BlockSize < 1 || BlockSize > MaxBlockSize)
+                    throw new InvalidDataException("Block size received was invalid (" + BlockSize + "). Datastream corruption likely.");
+
+                ReadRest(from);
+
+                Backing.Position = pos;
+            }
+
+            protected int ReadBlock(Stream from, byte[] buffer, ref long read)
+            {
+                int rd;
+                if (StreamLength - read < BlockSize)
+                    rd = from.Read(buffer, 0, (int)(StreamLength % BlockSize));
+                else rd = from.Read(buffer, 0, BlockSize);
+                if (rd > 0)
+                {
+                    Backing.Write(buffer, 0, rd);
+                    read += rd;
+                }
+                return rd;
+            }
+
+            protected virtual void ReadRest(Stream from)
+            {
+                int rd;
+                byte[] buffer = new byte[BlockSize];
+                long read = 0;
+                while (read < StreamLength)
+                {
+                    rd = ReadBlock(from, buffer, ref read);
+                }
+            }
+        }
+
+        /// <summary>
+        /// The function that a new Stream to write to when a LongStream is to be read. (By default returns a new MemoryStream).
+        /// </summary>
+        public Func<LongStream, Stream> LongStreamReadCreate { get; set; } = (t) => new MemoryStream();
+        /// <summary>
+        /// Called when a LongStream has been read.
+        /// </summary>
+        public event Action<LongStream> OnLongStreamReadComplete;
+        /// <summary>
+        /// Called after a LongStream has been written.
+        /// </summary>
+        public event Action<LongStream> OnLongStreamWriteComplete;
+
+       
+
         [Serializable]
         private class Internal : ISerializable
         {
@@ -239,7 +510,87 @@ namespace Sync
                     }
                 }
             }
+           // File.WriteAllText("fuck2", this.ToString());
+            List<LongStream> templates = new List<LongStream>();
+            List<string> keys = new List<string>();
+            Dictionary<Guid, LongStream> reads = new Dictionary<Guid, LongStream>();
+            
+            List<ArbitraryDataContainer> c_templates = new List<ArbitraryDataContainer>();
+            List<string> c_keys = new List<string>();
+
+            foreach (var vl in map.Hashtable)
+            {
+                if (vl.Value is LongStream)
+                {
+                    templates.Add(vl.Value as LongStream);
+                    keys.Add(vl.Key);
+                }
+                if (vl.Value is ArbitraryDataContainer)
+                {
+                    c_templates.Add(vl.Value as ArbitraryDataContainer);
+                    c_keys.Add(vl.Key);
+                }
+            }
+
+            //ADC
+            if (c_templates.Count > 0)
+            {
+                for (int i = 0; i < c_templates.Count; i++)
+                {
+                    var template = new ArbitraryDataContainer.Template();
+                    template.ReadStream(from);
+
+                    int j = 0;
+                    for (; j < c_templates.Count; j++)
+                    {
+                        var adc = c_templates[j];
+                        if (adc.UUID.Equals(template.UUID))
+                        {
+                            //Match, adc is correct type
+                            var ty = template.InvokeFrom(adc.GetType());
+                            ty.ReadStream(from);
+                            map.Hashtable[c_keys[j]] = ty;
+                            break;
+                        }
+                    }
+                    if (j >= c_templates.Count)
+                        throw new InvalidDataException("Unexpected ADC UUID received.");
+                }
+            }
+
+            //LongStream
+            if (templates.Count > 0)
+            {
+                //expected
+                for (int i = 0; i < templates.Count; i++)
+                {
+                    var ls = OnCreateLongStream();
+                    ls.StreamReadCreate = LongStreamReadCreate;
+                    ls.ReadStream(from);
+                    OnLongStreamReadComplete(ls);
+                    reads.Add(ls.UUID, ls);
+                }
+                //match them up
+                //foreach (var l in templates)
+                for(int i=0;i<templates.Count;i++)
+                {
+                    var l = templates[i];
+                    if (reads.ContainsKey(l.UUID))
+                    {
+                        var match = reads[l.UUID];
+                        if (match.StreamLength != l.StreamLength) throw new InvalidDataException("LongStream metadata incongruence.");
+                        //l.Backing = match.Backing;
+                        map.Hashtable[keys[i]] = match;
+                    }
+                    else throw new InvalidDataException("Expected LongStream UUID not received.");
+                }
+            }
         }
+
+        /// <summary>
+        /// When LongStream is requsted to be created for read.
+        /// </summary>
+        public Func<LongStream> OnCreateLongStream { get; set; }
 
         /// <summary>
         /// Write to stream.
@@ -259,9 +610,31 @@ namespace Sync
                 }
 
                 ms.Position = 0;
-                
+
                 writeSize(to, ms.Length);
                 ms.CopyTo(to);
+            }
+            List<LongStream> l_l = new List<LongStream>();
+            List<ArbitraryDataContainer> l_a = new List<ArbitraryDataContainer>();
+            foreach (var val in map.Hashtable)
+            {
+                if (val.Value is LongStream)
+                    l_l.Add(val.Value as LongStream);
+                else if (val.Value is ArbitraryDataContainer)
+                    l_a.Add(val.Value as ArbitraryDataContainer);
+            }
+
+            foreach (var adc in l_a)
+            {
+                var template = new ArbitraryDataContainer.Template(adc);
+                template.WriteStream(to);
+                adc.WriteStream(to);
+            }
+
+            foreach (var ls in l_l)
+            {
+                ls.WriteStream(to);
+                OnLongStreamWriteComplete(ls);
             }
         }
 
@@ -269,6 +642,105 @@ namespace Sync
         /// The max size allowed for reading messages. (default: int.MaxValue) (you probably shouldn't increase that)
         /// </summary>
         public static long MaxSize { get; set; } = int.MaxValue;
+    }
+
+    [Serializable]
+    public abstract class ArbitraryDataContainer : ISerializable
+    {
+        public Guid UUID { get { return guid; } }
+
+        public override bool Equals(object obj)
+        {
+            if (obj == null) return false;
+            else if (obj is ArbitraryDataContainer)
+                return (obj as ArbitraryDataContainer).guid.Equals(guid);
+            else
+                return guid.Equals(obj);
+        }
+
+        public override int GetHashCode()
+        {
+            return guid.GetHashCode();
+        }
+
+        public sealed class Template : ArbitraryDataContainer
+        {
+            public override void ReadStream(Stream from)
+            {
+                byte[] by = new byte[16];
+
+                from.Read(by, 0, 16);
+                guid = new Guid(by);
+
+                var fmt = new System.Runtime.Serialization.Formatters.Binary.BinaryFormatter();
+                Tag = fmt.Deserialize(from);
+            }
+
+            public override void WriteStream(Stream to)
+            {
+                byte[] by = guid.ToByteArray();
+
+                to.Write(by, 0, 16);
+                var fmt = new System.Runtime.Serialization.Formatters.Binary.BinaryFormatter();
+                fmt.Serialize(to, Tag);
+            }
+
+            public Template(ArbitraryDataContainer from)
+            {
+                this.guid = from.guid;
+                this.Tag = from.Tag;
+            }
+
+            public ArbitraryDataContainer InvokeFrom(Type type)
+            {
+                if (typeof(ArbitraryDataContainer).IsAssignableFrom(type))
+                {
+                    ArbitraryDataContainer container = (ArbitraryDataContainer)Activator.CreateInstance(type);
+                    container.guid = guid;
+                    container.Tag = Tag;
+                    return container;
+                }
+                else throw new InvalidCastException("Type " + type.Name + " is not an ADC");
+            }
+
+            public Template()
+            {
+
+            }
+        }
+
+        private Guid guid;
+        public object Tag { get; set; } = null;
+        public ArbitraryDataContainer(object tag)
+        {
+            Tag = tag;
+            guid = Guid.NewGuid();
+        }
+
+        public ArbitraryDataContainer() : this(null)
+        {
+
+        }
+
+        public override string ToString()
+        {
+            return this.GetType().Name + "@" + guid.ToString() + (Tag == null ? "" : ":" + Tag.ToString());
+        }
+
+        public ArbitraryDataContainer(SerializationInfo info, StreamingContext context)
+        {
+            guid = new Guid(info.GetValue("id", typeof(byte[])) as byte[]);
+            Tag = info.GetValue("tag", typeof(object));
+        }
+
+        public void GetObjectData(SerializationInfo info, StreamingContext context)
+        {
+            info.AddValue("tag", Tag);
+            info.AddValue("id", guid.ToByteArray());
+        }
+
+        public abstract void WriteStream(Stream to);
+        public abstract void ReadStream(Stream from);
     }
 
     public static class Extensions
@@ -279,16 +751,15 @@ namespace Sync
         public static void BlockingRead(this Stream s, byte[] to, int offset, int length)
         {
             int read = 0;
-            while ((read += s.Read(to, offset + read, length - read)) < length) ;
+            int rd = 0;
+            while ((read += (rd = s.Read(to, offset + read, length - read))) < length) if (rd == 0) throw new ClientReadException(new IOException(), "Blocking read hang.");
         }
-
-        
     }
 
     /// <summary>
     /// Exception in Client I/O.
     /// </summary>
-    public abstract class ClientException : Exception
+    public class ClientException : Exception
     {
         public ClientException(Exception from, string s) : base(s, from) { }
 
@@ -330,6 +801,12 @@ namespace Sync
             After = end;
         }
 
+        public void Disuse()
+        {
+            useok = false;
+        }
+        private bool useok = true;
+
         public Preset Use()
         {
             Before();
@@ -338,6 +815,7 @@ namespace Sync
 
         public void Dispose()
         {
+            if(useok)
             After();
         }
     }
@@ -347,6 +825,10 @@ namespace Sync
     /// </summary>
     public class Client : IDisposable, IChannel<Message>
     {
+        public Func<Message.LongStream, Stream> LongStreamReadCreate { get; set; } = (t) => new MemoryStream();
+        public event Action<Message.LongStream> OnLongStreamReadComplete;
+        public Func<Message.LongStream> OnLongStreamCreate { get; set; } = () => new Message.LongStream();
+
         /// <summary>
         /// Channel for when message is received. Read from this.
         /// </summary>
@@ -384,16 +866,12 @@ namespace Sync
         /// <summary>
         /// Is this connection alive?
         /// </summary>
-        public bool Alive { get; private set; } = true;
+        public bool Alive { get { return Out.IsOpen && In.IsOpen; } }
 
         /// <summary>
         /// Event ran on closing (before resources released).
         /// </summary>
         public event Action OnClose;
-        /// <summary>
-        /// Event ran on exception (Read or Write call).
-        /// </summary>
-        public event Action<ClientException> OnException;
         
         private ManualResetEvent up;
 
@@ -404,6 +882,8 @@ namespace Sync
         {
             up.WaitOne();
         }
+
+
 
         /// <summary>
         /// Keep backing stream alive after closing?
@@ -439,7 +919,7 @@ namespace Sync
         /// </summary>
         /// <param name="stream">The stream to use.</param>
         /// <param name="keepAlive">Keep stream alive after closing?</param>
-        public Client(Stream stream, bool keepAlive=false)
+        public Client(Stream stream, bool keepAlive = false) : this()
         {
             this.backing = stream;
             this.KeepAlive = keepAlive;
@@ -451,8 +931,12 @@ namespace Sync
             In = new Channel<Message>();
             Out = new Channel<Message>();
             up = new ManualResetEvent(false);
+
+            
         }
-        
+
+        public bool CloseOnException { get; set; } = false;
+
         /// <summary>
         /// Set up the pipeline for this client. (note: this call blocks until the client closes, run it asyncrounously if you do not want that.)
         /// </summary>
@@ -465,41 +949,62 @@ namespace Sync
                     var msg = Out.Receive();
                     if (Out.IsOpen)
                     {
-                        lock (backing)
+
+                        //var sd = OnSend.Use();
+                        using (OnSend.Use())
                         {
                             try
                             {
-                                using (OnSend.Use())
-                                {
-                                    msg.Write(backing);
-                                }
-                                _ = SignalHandler.Signal(SignalMessageSent, msg);
-
+                                msg.Write(backing);
                             }
-                            catch (Exception e) {if(OnException!=null) OnException(new ClientWriteException(e, "Error writing to stream")); }
+                            catch (Exception) { OnSend.Disuse(); Close(); }
                         }
+                        //sd.Dispose();
+                        _ = SignalHandler.Signal(SignalMessageSent, msg);
                     }
                 }
-                if (!KeepAlive) backing.Dispose();
+
+                if (!KeepAlive) try { backing.Dispose(); }
+                    catch
+                    {
+                    }
             });
             up.Set();
             while (In.IsOpen)
             {
+
                 Message message = null;
                 try
                 {
+                    //var recv = OnReceive.Use();
                     using (OnReceive.Use())
                     {
-                        message = new Message(backing);
+                        try
+                        {
+                            message = new Message();
+                            message.OnCreateLongStream = OnLongStreamCreate;
+                            message.LongStreamReadCreate = LongStreamReadCreate;
+                            message.OnLongStreamReadComplete += OnLongStreamReadComplete;
+                            message.Read(backing);
+                        }
+                        catch (Exception )
+                        {
+                            OnReceive.Disuse();
+                            Close();
+                        }
                     }
-                    if (In.IsOpen) {
+                    //recv.Dispose();
+                    if (In.IsOpen)
+                    {
                         In.Send(message);
                         _ = SignalHandler.Signal(SignalMessageReceived, message);
                     }
                 }
-                catch (Exception e)
+                catch (Exception)
                 {
-                    if (Alive && OnException!=null) OnException(new ClientReadException(e, "Error reading from stream"));
+                    Close();
+                    //OnException(new ClientReadException(e, "Error reading from stream"));
+
                 }
             }
         }
@@ -509,19 +1014,23 @@ namespace Sync
         /// </summary>
         public void Dispose()
         {
-            if (!Alive) return;
+            if (!Alive)
+            {
+                Out.Close();
+                In.Close();
+                return;
+            }
 
             up.WaitOne();
 
-            if (OnClose != null)
-                OnClose();
-
-            Alive = false;
-
+            In.Close();
+            Out.Close();
+            
             up.Dispose();
             SignalHandler = new Dispatcher<Message>();
-            Out.Close();
-            In.Close();
+
+            if (OnClose != null)
+                OnClose();
         }
 
         /// <summary>
